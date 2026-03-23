@@ -12,11 +12,10 @@
  *   - https://kt.gov.lt/lt/dokumentai/koncentracijos      — Merger control
  *     (koncentracijos): clearance decisions, conditional approvals, prohibitions
  *
- * Individual decision pages expose metadata in the page body:
- *   - Bylos numeris / Nutarimo Nr. (case number)
- *   - Data / Nutarimo data        (decision date, yyyy-MM-dd or Lithuanian text)
- *   - Šalys / Dalyviai             (parties involved)
- *   - Rezoliucinė dalis           (operative part / summary)
+ * KT listing pages render decisions inline as `div.docs_item` elements
+ * containing date, case number, and a link to the decision PDF. There are
+ * no individual HTML decision pages — all metadata lives on the listing
+ * pages themselves.
  *
  * Usage:
  *   npx tsx scripts/ingest-kt.ts
@@ -25,6 +24,10 @@
  *   npx tsx scripts/ingest-kt.ts --force
  *   npx tsx scripts/ingest-kt.ts --max-pages 5
  */
+
+// kt.gov.lt serves an incomplete certificate chain (PerfectSSL intermediate
+// CA missing). Node.js rejects this by default. Allow it so fetch() works.
+process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0";
 
 import Database from "better-sqlite3";
 import {
@@ -36,6 +39,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import * as cheerio from "cheerio";
+import type { AnyNode } from "domhandler";
 import { SCHEMA_SQL } from "../src/db.js";
 
 // ---------------------------------------------------------------------------
@@ -67,8 +71,26 @@ const LISTING_CATEGORIES = [
   {
     id: "koncentracijos",
     path: "/lt/dokumentai/koncentracijos",
-    maxPages: 30,
+    maxPages: 100,
     isMerger: true,
+  },
+  {
+    id: "koncentracijos-be-leidimo",
+    path: "/lt/dokumentai/koncentracijos-igyvendinimas-be-konkurencijos-tarybos-leidimo",
+    maxPages: 10,
+    isMerger: true,
+  },
+  {
+    id: "konkurencija-ribojantys-susitarimai",
+    path: "/lt/dokumentai/konkurencija-ribojantys-susitarimai",
+    maxPages: 30,
+    isMerger: false,
+  },
+  {
+    id: "viesieji-subjektai",
+    path: "/lt/dokumentai/viesieji-subjektai",
+    maxPages: 20,
+    isMerger: false,
   },
 ] as const;
 
@@ -117,6 +139,26 @@ interface ParsedMerger {
   full_text: string;
   outcome: string | null;
   turnover: number | null;
+}
+
+/**
+ * An item scraped directly from a listing page's `div.docs_item`.
+ * KT has no individual HTML decision pages — decisions link to PDFs.
+ * All metadata is inline on the listing page.
+ */
+interface ListingItem {
+  /** Decision date from `.docs_dates` (e.g. "2026 02 10") */
+  dateRaw: string;
+  /** Case number from `.docs_dates` (e.g. "Nutarimo Nr.: 1S-12 (2026)") */
+  caseNumberRaw: string;
+  /** Publication date if present */
+  pubDateRaw: string;
+  /** Decision title from `.docs_link a` text */
+  title: string;
+  /** PDF URL (absolute) */
+  pdfUrl: string;
+  /** The listing category this came from */
+  category: (typeof LISTING_CATEGORIES)[number];
 }
 
 // ---------------------------------------------------------------------------
@@ -212,200 +254,174 @@ function saveState(state: IngestState): void {
 }
 
 // ---------------------------------------------------------------------------
-// Listing page parsing — discover individual decision URLs
+// Listing page parsing — scrape inline decision data from listing pages
 // ---------------------------------------------------------------------------
 
 /**
- * Crawl paginated listing pages to discover decision/merger URLs.
+ * Parse a single `div.docs_item` element from a listing page.
  *
- * KT decisions listing uses ?page=N pagination (1-indexed).
- * KT concentration pages list links to individual decisions directly,
- * and may also have sub-category pages (e.g. "koncentracijos-igyvendinimas-
- * be-konkurencijos-tarybos-leidimo").
+ * Structure (confirmed 2026-03-23):
+ *   <div class="docs_item">
+ *     <div class="docs_item_head clearfix">
+ *       <ul class="docs_dates">
+ *         <li class="float-start">2026 02 10</li>                       ← decision date
+ *         <li class="float-start">Nutarimo Nr.: 1S-12 (2026)</li>      ← case number
+ *         <li class="float-end">Paskelbimo data: 2026 02 12</li>       ← publication date
+ *       </ul>
+ *     </div>
+ *     <div class="docs_link">
+ *       <a href="/uploads/docs/docs/2026-02/hash.pdf" ...>
+ *         <p>Title text</p>
+ *       </a>
+ *     </div>
+ *   </div>
  */
-async function discoverUrlsFromListings(
+function parseDocsItem(
+  $: cheerio.CheerioAPI,
+  el: AnyNode,
+  category: (typeof LISTING_CATEGORIES)[number],
+): ListingItem | null {
+  const $el = $(el);
+
+  // Extract date items from .docs_dates li elements
+  const dateItems: string[] = [];
+  $el.find(".docs_dates li").each((_i, li) => {
+    dateItems.push($(li).text().trim());
+  });
+
+  // First li is typically the decision date (e.g. "2026 02 10")
+  const dateRaw = dateItems[0] ?? "";
+
+  // Second li is typically the case number (e.g. "Nutarimo Nr.: 1S-12 (2026)")
+  const caseNumberRaw = dateItems.length > 1 ? dateItems[1]! : "";
+
+  // Third li (if present) is the publication date
+  const pubDateRaw = dateItems.length > 2 ? dateItems[2]! : "";
+
+  // Title from the link text inside .docs_link
+  const linkEl = $el.find(".docs_link a").first();
+  const title = linkEl.text().replace(/\s+/g, " ").trim();
+  if (!title) return null;
+
+  // PDF URL
+  let pdfHref = linkEl.attr("href") ?? "";
+  if (pdfHref && !pdfHref.startsWith("http")) {
+    // Handle protocol-relative (//kt.gov.lt/...) or path-relative (/uploads/...)
+    if (pdfHref.startsWith("//")) {
+      pdfHref = `https:${pdfHref}`;
+    } else {
+      pdfHref = `${BASE_URL}${pdfHref}`;
+    }
+  }
+
+  return {
+    dateRaw,
+    caseNumberRaw,
+    pubDateRaw,
+    title,
+    pdfUrl: pdfHref,
+    category,
+  };
+}
+
+/**
+ * Parse the case number from the raw listing text.
+ *
+ * Input examples:
+ *   "Nutarimo Nr.: 1S-12 (2026)"
+ *   "Nutarimo Nr.: 1S-120 (2025)"
+ *   "Nutarimo Nr.: 1S-29(2026)"
+ *   "Nutarimo Nr.: 1S-9 (2026)"
+ * Returns: "1S-12 (2026)" etc.
+ */
+function parseCaseNumberFromListing(raw: string): string {
+  // Strip common prefix labels
+  const cleaned = raw
+    .replace(/^nutarimo\s+nr\.?\s*:?\s*/i, "")
+    .replace(/^nr\.?\s*:?\s*/i, "")
+    .trim();
+  return cleaned || raw.trim();
+}
+
+/**
+ * Parse a KT listing date ("2026 02 10") to ISO format.
+ * Falls back to parseLithuanianDate for other formats.
+ */
+function parseListingDate(raw: string): string | null {
+  if (!raw) return null;
+  // "2026 02 10" → "2026-02-10"
+  const spaceMatch = raw.match(/^(\d{4})\s+(\d{2})\s+(\d{2})$/);
+  if (spaceMatch) {
+    return `${spaceMatch[1]}-${spaceMatch[2]}-${spaceMatch[3]}`;
+  }
+  return parseLithuanianDate(raw);
+}
+
+/**
+ * Crawl paginated listing pages and extract structured items directly.
+ *
+ * KT listing pages use ?page=N pagination (1-indexed). Each page shows
+ * ~12 items as div.docs_item elements. Decision content is in PDFs, not
+ * individual HTML pages.
+ */
+async function scrapeListingItems(
   category: (typeof LISTING_CATEGORIES)[number],
   maxPages: number,
-): Promise<string[]> {
-  const urls: string[] = [];
+): Promise<ListingItem[]> {
+  const items: ListingItem[] = [];
+  const seenPdfUrls = new Set<string>();
   const effectiveMax = maxPagesOverride
     ? Math.min(maxPagesOverride, maxPages)
     : maxPages;
 
   console.log(
-    `\n  Discovering URLs from ${category.id} (up to ${effectiveMax} pages)...`,
+    `\n  Scraping items from ${category.id} (up to ${effectiveMax} pages)...`,
   );
 
-  if (category.id === "koncentracijos") {
-    // Merger pages: first discover sub-category pages, then individual decisions
-    await discoverMergerUrls(category.path, urls, effectiveMax);
-  } else {
-    // Decisions: standard pagination with ?page=N
-    for (let page = 1; page <= effectiveMax; page++) {
-      const listUrl =
-        page === 1
-          ? `${BASE_URL}${category.path}`
-          : `${BASE_URL}${category.path}?page=${page}`;
+  for (let page = 1; page <= effectiveMax; page++) {
+    const listUrl =
+      page === 1
+        ? `${BASE_URL}${category.path}`
+        : `${BASE_URL}${category.path}?page=${page}`;
 
-      if (page % 10 === 1 || page === 1) {
-        console.log(
-          `    Fetching listing page ${page}/${effectiveMax}... (${urls.length} URLs so far)`,
-        );
-      }
+    if (page % 10 === 1 || page === 1) {
+      console.log(
+        `    Fetching listing page ${page}/${effectiveMax}... (${items.length} items so far)`,
+      );
+    }
 
-      const html = await rateLimitedFetch(listUrl);
-      if (!html) {
-        console.warn(`    [WARN] Could not fetch listing page ${page}`);
-        continue;
-      }
+    const html = await rateLimitedFetch(listUrl);
+    if (!html) {
+      console.warn(`    [WARN] Could not fetch listing page ${page}`);
+      continue;
+    }
 
-      const $ = cheerio.load(html);
-      let pageUrls = 0;
+    const $ = cheerio.load(html);
+    let pageItems = 0;
 
-      // KT listing pages render decision entries as linked items.
-      // Links to individual decision pages are under /lt/dokumentai/
-      // and have longer paths than the listing itself.
-      $("a[href]").each((_i, el) => {
-        const href = $(el).attr("href");
-        if (!href) return;
+    $("div.docs_item").each((_i, el) => {
+      const item = parseDocsItem($, el, category);
+      if (!item) return;
 
-        // Absolute paths starting with /lt/dokumentai/ that point to
-        // individual decisions (not the listing page itself, not pagination,
-        // not category index pages).
-        if (
-          href.startsWith("/lt/dokumentai/") &&
-          !href.includes("?page=") &&
-          !href.includes("/sarasas/") &&
-          !href.includes("/teismo-sprendimas/") &&
-          href.length > 25 &&
-          !href.endsWith("/dokumentai/") &&
-          !href.endsWith("/koncentracijos")
-        ) {
-          const fullUrl = href.startsWith("http")
-            ? href
-            : `${BASE_URL}${href}`;
-          if (!urls.includes(fullUrl)) {
-            urls.push(fullUrl);
-            pageUrls++;
-          }
-        }
-      });
+      // Deduplicate by PDF URL
+      if (seenPdfUrls.has(item.pdfUrl)) return;
+      seenPdfUrls.add(item.pdfUrl);
 
-      // If no new URLs found on this page, pagination is exhausted
-      if (pageUrls === 0 && page > 1) {
-        console.log(
-          `    No new URLs on page ${page} — stopping pagination for ${category.id}`,
-        );
-        break;
-      }
+      items.push(item);
+      pageItems++;
+    });
+
+    // If no new items found on this page, pagination is exhausted
+    if (pageItems === 0 && page > 1) {
+      console.log(
+        `    No new items on page ${page} — stopping pagination for ${category.id}`,
+      );
+      break;
     }
   }
 
-  console.log(`    Discovered ${urls.length} URLs from ${category.id}`);
-  return urls;
-}
-
-/**
- * Discover merger (concentration) decision URLs.
- *
- * The /lt/dokumentai/koncentracijos page contains links to sub-category
- * pages and individual decisions. We crawl both levels.
- */
-async function discoverMergerUrls(
-  basePath: string,
-  urls: string[],
-  maxPages: number,
-): Promise<void> {
-  const indexUrl = `${BASE_URL}${basePath}`;
-  const html = await rateLimitedFetch(indexUrl);
-  if (!html) {
-    console.warn(`    [WARN] Could not fetch merger index page`);
-    return;
-  }
-
-  const $ = cheerio.load(html);
-  const subPages: string[] = [];
-
-  // Collect sub-category links and individual decision links
-  $("a[href]").each((_i, el) => {
-    const href = $(el).attr("href");
-    if (!href) return;
-
-    if (
-      href.startsWith(basePath) &&
-      href !== basePath &&
-      !href.includes("?page=") &&
-      href.length > basePath.length + 3
-    ) {
-      const fullUrl = `${BASE_URL}${href}`;
-
-      // Long slug = individual decision; short slug = sub-category index
-      const remainder = href.slice(basePath.length).replace(/^\//, "");
-      const segments = remainder.split("/").filter(Boolean);
-
-      if (segments.length >= 1 && remainder.length > 40) {
-        // Likely an individual decision page
-        if (!urls.includes(fullUrl)) urls.push(fullUrl);
-      } else if (segments.length >= 1) {
-        // Likely a sub-category page — queue for deeper crawling
-        if (!subPages.includes(fullUrl)) subPages.push(fullUrl);
-      }
-    }
-
-    // Also catch links under /lt/dokumentai/del-* which are common for
-    // concentration decisions
-    if (
-      href.startsWith("/lt/dokumentai/del-") &&
-      href.toLowerCase().includes("koncentracij")
-    ) {
-      const fullUrl = `${BASE_URL}${href}`;
-      if (!urls.includes(fullUrl)) urls.push(fullUrl);
-    }
-  });
-
-  // Crawl sub-category pages to find more individual decision links
-  let subPagesCrawled = 0;
-  for (const subUrl of subPages) {
-    if (subPagesCrawled >= maxPages) break;
-    subPagesCrawled++;
-
-    console.log(
-      `    Crawling merger sub-page: ${subUrl.replace(BASE_URL, "")}`,
-    );
-
-    // Each sub-category page may also be paginated
-    for (let page = 1; page <= 20; page++) {
-      const pageUrl =
-        page === 1 ? subUrl : `${subUrl}?page=${page}`;
-
-      const subHtml = await rateLimitedFetch(pageUrl);
-      if (!subHtml) break;
-
-      const $sub = cheerio.load(subHtml);
-      let pageCount = 0;
-
-      $sub("a[href]").each((_i, el) => {
-        const href = $sub(el).attr("href");
-        if (!href) return;
-
-        if (
-          href.startsWith("/lt/dokumentai/") &&
-          href.length > 40 &&
-          !href.includes("?page=") &&
-          !href.includes("/sarasas/") &&
-          !href.endsWith("/koncentracijos")
-        ) {
-          const fullUrl = `${BASE_URL}${href}`;
-          if (!urls.includes(fullUrl)) {
-            urls.push(fullUrl);
-            pageCount++;
-          }
-        }
-      });
-
-      if (pageCount === 0 && page > 1) break;
-    }
-  }
+  console.log(`    Scraped ${items.length} items from ${category.id}`);
+  return items;
 }
 
 // ---------------------------------------------------------------------------
@@ -1151,7 +1167,7 @@ function extractMergerParties(
   title: string,
   bodyText: string,
 ): { acquiring: string | null; target: string | null } {
-  // Pattern 1: "X" ĮSIGYTI / ĮSIGYJANT "Y"
+  // Pattern 1a: "LEIDIMO X ĮSIGYTI/ĮSIGYJANT Y AKCIJŲ"
   const acquireMatch = title.match(
     /(?:LEIDIMO|LEIDO)\s+(.+?)\s+(?:ĮSIGYTI|ĮSIGYJANT|VYKDYTI\s+KONCENTRACIJĄ\s+ĮSIGYJANT)\s+(.+?)(?:\s+AKCI[JŲ]|\s+TURTO|\s*$)/i,
   );
@@ -1159,6 +1175,17 @@ function extractMergerParties(
     return {
       acquiring: cleanPartyName(acquireMatch[1]!),
       target: cleanPartyName(acquireMatch[2]!),
+    };
+  }
+
+  // Pattern 1b: Listing page format "Leisti vykdyti koncentraciją X įsigyjant Y akcijų"
+  const listingMatch = title.match(
+    /(?:leisti\s+vykdyti\s+koncentraciją|koncentracija)\s+(.+?)\s+(?:įsigyjant|įsigyti)\s+(.+?)(?:\s+akci[jų]|\s+ir\s+(?:tokiu\s+)?būdu|\s*$)/i,
+  );
+  if (listingMatch) {
+    return {
+      acquiring: cleanPartyName(listingMatch[1]!),
+      target: cleanPartyName(listingMatch[2]!),
     };
   }
 
@@ -1509,44 +1536,38 @@ async function main(): Promise<void> {
   const state = loadState();
   const processedSet = new Set(state.processedUrls);
 
-  // Step 1: Discover URLs from all listing categories
-  const allUrls: Array<{
-    url: string;
-    category: (typeof LISTING_CATEGORIES)[number];
-  }> = [];
+  // Step 1: Scrape listing pages to extract items directly.
+  // KT has no individual HTML decision pages — all metadata is inline
+  // on the listing pages, and decisions link to PDFs.
+  const allItems: ListingItem[] = [];
 
   for (const category of LISTING_CATEGORIES) {
-    const urls = await discoverUrlsFromListings(
-      category,
-      category.maxPages,
-    );
-    for (const url of urls) {
-      allUrls.push({ url, category });
-    }
+    const items = await scrapeListingItems(category, category.maxPages);
+    allItems.push(...items);
   }
 
-  // Deduplicate by URL
-  const seenUrls = new Set<string>();
-  const dedupedUrls = allUrls.filter(({ url }) => {
-    if (seenUrls.has(url)) return false;
-    seenUrls.add(url);
+  // Deduplicate by PDF URL across categories
+  const seenPdfUrls = new Set<string>();
+  const dedupedItems = allItems.filter((item) => {
+    if (seenPdfUrls.has(item.pdfUrl)) return false;
+    seenPdfUrls.add(item.pdfUrl);
     return true;
   });
 
-  // Filter already-processed URLs (for --resume)
-  const urlsToProcess = resume
-    ? dedupedUrls.filter(({ url }) => !processedSet.has(url))
-    : dedupedUrls;
+  // Filter already-processed items (for --resume, keyed by PDF URL)
+  const itemsToProcess = resume
+    ? dedupedItems.filter((item) => !processedSet.has(item.pdfUrl))
+    : dedupedItems;
 
-  console.log(`\nRasta URL adresų:    ${dedupedUrls.length}`);
-  console.log(`Apdoroti reikia:     ${urlsToProcess.length}`);
-  if (resume && dedupedUrls.length !== urlsToProcess.length) {
+  console.log(`\nRasta elementų:      ${dedupedItems.length}`);
+  console.log(`Apdoroti reikia:     ${itemsToProcess.length}`);
+  if (resume && dedupedItems.length !== itemsToProcess.length) {
     console.log(
-      `  Praleidžiama ${dedupedUrls.length - urlsToProcess.length} jau apdorotų URL`,
+      `  Praleidžiama ${dedupedItems.length - itemsToProcess.length} jau apdorotų elementų`,
     );
   }
 
-  if (urlsToProcess.length === 0) {
+  if (itemsToProcess.length === 0) {
     console.log("Nėra ką apdoroti. Baigta.");
     return;
   }
@@ -1560,30 +1581,104 @@ async function main(): Promise<void> {
     stmts = prepareStatements(db);
   }
 
-  // Step 3: Process each URL
+  // Step 3: Process each scraped item — convert to decision or merger
   let decisionsIngested = 0;
   let mergersIngested = 0;
   let errors = 0;
   let skipped = 0;
 
-  for (let i = 0; i < urlsToProcess.length; i++) {
-    const { url, category } = urlsToProcess[i]!;
-    const progress = `[${i + 1}/${urlsToProcess.length}]`;
+  for (let i = 0; i < itemsToProcess.length; i++) {
+    const item = itemsToProcess[i]!;
+    const progress = `[${i + 1}/${itemsToProcess.length}]`;
 
-    console.log(`${progress} ${category.id} | ${url}`);
-
-    const html = await rateLimitedFetch(url);
-    if (!html) {
-      console.log(`  PRALEISTA — nepavyko gauti`);
-      state.errors.push(`fetch_failed: ${url}`);
-      errors++;
-      continue;
-    }
+    console.log(`${progress} ${item.category.id} | ${item.title.slice(0, 90)}`);
 
     try {
-      const { decision, merger } = parsePage(html, url, category.isMerger);
+      const caseNumber = parseCaseNumberFromListing(item.caseNumberRaw);
+      const date = parseListingDate(item.dateRaw);
+      const isMerger = item.category.isMerger;
+      const title = item.title;
+      // Use title as body text for classification (no separate page to fetch)
+      const bodyText = title;
+      const sector = classifySector(title, bodyText);
+      const summary = title;
 
-      if (decision) {
+      const isMergerFromTitle =
+        isMerger ||
+        title.toLowerCase().includes("koncentracij") ||
+        (title.toLowerCase().includes("leidimo") &&
+          (title.toLowerCase().includes("įsigyti") ||
+            title.toLowerCase().includes("vykdyti koncentracij")));
+
+      if (isMergerFromTitle) {
+        const { acquiring, target } = extractMergerParties(title, bodyText);
+        const outcome = classifyMergerOutcome(title, bodyText);
+
+        const merger: ParsedMerger = {
+          case_number: caseNumber || `KT-PDF/${item.pdfUrl.split("/").pop()?.replace(".pdf", "") ?? "unknown"}`,
+          title,
+          date,
+          sector,
+          acquiring_party: acquiring,
+          target,
+          summary,
+          full_text: title,
+          outcome,
+          turnover: null,
+        };
+
+        if (dryRun) {
+          console.log(
+            `  KONCENTRACIJA: ${merger.case_number} — ${merger.title.slice(0, 80)}`,
+          );
+          console.log(
+            `    sektorius=${merger.sector}, baigtis=${merger.outcome}, įsigyjantis=${merger.acquiring_party?.slice(0, 50)}`,
+          );
+        } else {
+          const stmt = force
+            ? stmts!.upsertMerger
+            : stmts!.insertMerger;
+          stmt.run(
+            merger.case_number,
+            merger.title,
+            merger.date,
+            merger.sector,
+            merger.acquiring_party,
+            merger.target,
+            merger.summary,
+            merger.full_text,
+            merger.outcome,
+            merger.turnover,
+          );
+          console.log(
+            `  ĮRAŠYTA koncentracija: ${merger.case_number}`,
+          );
+        }
+
+        mergersIngested++;
+      } else {
+        const { type, outcome } = classifyDecisionType(title, bodyText);
+        const fineAmount = extractFineAmount(title);
+        const legalArticles = extractLegalArticles(title);
+
+        const decision: ParsedDecision = {
+          case_number: caseNumber || `KT-PDF/${item.pdfUrl.split("/").pop()?.replace(".pdf", "") ?? "unknown"}`,
+          title,
+          date,
+          type,
+          sector,
+          parties: null,
+          summary,
+          full_text: title,
+          outcome: outcome ?? (fineAmount ? "fine" : null),
+          fine_amount: fineAmount,
+          gwb_articles:
+            legalArticles.length > 0
+              ? JSON.stringify(legalArticles)
+              : null,
+          status: "final",
+        };
+
         if (dryRun) {
           console.log(
             `  SPRENDIMAS: ${decision.case_number} — ${decision.title.slice(0, 80)}`,
@@ -1615,59 +1710,26 @@ async function main(): Promise<void> {
         }
 
         decisionsIngested++;
-      } else if (merger) {
-        if (dryRun) {
-          console.log(
-            `  KONCENTRACIJA: ${merger.case_number} — ${merger.title.slice(0, 80)}`,
-          );
-          console.log(
-            `    sektorius=${merger.sector}, baigtis=${merger.outcome}, įsigyjantis=${merger.acquiring_party?.slice(0, 50)}`,
-          );
-        } else {
-          const stmt = force
-            ? stmts!.upsertMerger
-            : stmts!.insertMerger;
-          stmt.run(
-            merger.case_number,
-            merger.title,
-            merger.date,
-            merger.sector,
-            merger.acquiring_party,
-            merger.target,
-            merger.summary,
-            merger.full_text,
-            merger.outcome,
-            merger.turnover,
-          );
-          console.log(
-            `  ĮRAŠYTA koncentracija: ${merger.case_number}`,
-          );
-        }
-
-        mergersIngested++;
-      } else {
-        console.log(`  PRALEISTA — nepavyko išgauti struktūrinių duomenų`);
-        skipped++;
       }
 
-      // Mark URL as processed
-      processedSet.add(url);
-      state.processedUrls.push(url);
+      // Mark item as processed (keyed by PDF URL)
+      processedSet.add(item.pdfUrl);
+      state.processedUrls.push(item.pdfUrl);
     } catch (err) {
       const message =
         err instanceof Error ? err.message : String(err);
       console.error(`  KLAIDA: ${message}`);
-      state.errors.push(`parse_error: ${url}: ${message}`);
+      state.errors.push(`parse_error: ${item.pdfUrl}: ${message}`);
       errors++;
     }
 
-    // Save state periodically (every 25 URLs)
+    // Save state periodically (every 25 items)
     if ((i + 1) % 25 === 0) {
       state.decisionsIngested += decisionsIngested;
       state.mergersIngested += mergersIngested;
       saveState(state);
       console.log(
-        `  [tarpinė būsena] Būsena išsaugota po ${i + 1} URL`,
+        `  [tarpinė būsena] Būsena išsaugota po ${i + 1} elementų`,
       );
     }
   }
