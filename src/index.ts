@@ -18,6 +18,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { searchDecisions, getDecision, searchMergers, getMerger, listSectors } from "./db.js";
+import { buildCitation } from "./utils/citation.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -116,9 +117,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "lt_comp_search_decisions": { const p = SearchDecisionsArgs.parse(args); const r = searchDecisions({ query: p.query, type: p.type, sector: p.sector, outcome: p.outcome, limit: p.limit }); return textContent({ results: r, count: r.length }); }
-      case "lt_comp_get_decision": { const p = GetDecisionArgs.parse(args); const d = getDecision(p.case_number); return d ? textContent(d) : errorContent(`Decision not found: ${p.case_number}`); }
+      case "lt_comp_get_decision": { const p = GetDecisionArgs.parse(args); const d = getDecision(p.case_number); if (!d) return errorContent(`Decision not found: ${p.case_number}`); const dr = d as Record<string, unknown>; return textContent({ ...d, _citation: buildCitation(String(dr.case_number || p.case_number), String(dr.title || dr.case_number || p.case_number), "lt_comp_get_decision", { case_number: p.case_number }, dr.source_url as string | undefined) }); }
       case "lt_comp_search_mergers": { const p = SearchMergersArgs.parse(args); const r = searchMergers({ query: p.query, sector: p.sector, outcome: p.outcome, limit: p.limit }); return textContent({ results: r, count: r.length }); }
-      case "lt_comp_get_merger": { const p = GetMergerArgs.parse(args); const m = getMerger(p.case_number); return m ? textContent(m) : errorContent(`Merger case not found: ${p.case_number}`); }
+      case "lt_comp_get_merger": { const p = GetMergerArgs.parse(args); const m = getMerger(p.case_number); if (!m) return errorContent(`Merger case not found: ${p.case_number}`); const mr = m as Record<string, unknown>; return textContent({ ...m, _citation: buildCitation(String(mr.case_number || p.case_number), String(mr.title || mr.case_number || p.case_number), "lt_comp_get_merger", { case_number: p.case_number }, mr.source_url as string | undefined) }); }
       case "lt_comp_list_sectors": { const s = listSectors(); return textContent({ sectors: s, count: s.length }); }
       case "lt_comp_about": return textContent({ name: SERVER_NAME, version: pkgVersion, description: "KT (Konkurencijos taryba — Competition Council of Lithuania) MCP server. Provides access to Lithuanian competition law enforcement decisions, merger control cases, and sector enforcement data under the KĮ (Konkurencijos įstatymas).", data_source: "Konkurencijos taryba (https://kt.gov.lt/)", coverage: { decisions: "Abuse of dominance, cartel enforcement, and sector inquiries under KĮ", mergers: "Merger control decisions (concentrations) — Phase I and Phase II", sectors: "Telecommunications, energy, retail, financial services, digital economy, pharmaceutical" }, tools: TOOLS.map(t => ({ name: t.name, description: t.description })) });
       default: return errorContent(`Unknown tool: ${name}`);
